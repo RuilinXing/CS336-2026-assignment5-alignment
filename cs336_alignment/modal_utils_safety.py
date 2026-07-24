@@ -5,7 +5,9 @@ Usage: see modal_utils.py.
 
 from __future__ import annotations
 
+import argparse
 import subprocess
+import sys
 
 import modal
 
@@ -85,3 +87,19 @@ def submit_commands(commands: list[list[str]]) -> None:
     if failures:
         print(f"{len(failures)} of {len(commands)} Modal jobs failed.", flush=True)
         raise SystemExit(1)
+
+
+@app.local_entrypoint(name="submit")
+def modal_main(*argv: str) -> None:
+    """Submit one supplement script with the shared data and results volumes."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("script", choices=("evaluate", "sft", "dpo"))
+    parser.add_argument("script_args", nargs=argparse.REMAINDER)
+    args = parser.parse_args(list(argv))
+    script_paths = {
+        "evaluate": "scripts/evaluate_safety_benchmarks.py",
+        "sft": "scripts/train_sft.py",
+        "dpo": "scripts/train_dpo.py",
+    }
+    script_args = args.script_args[1:] if args.script_args[:1] == ["--"] else args.script_args
+    submit_commands([[sys.executable, "-u", script_paths[args.script], *script_args]])

@@ -8,6 +8,8 @@ from torch import Tensor
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 
+from cs336_alignment import grpo
+from cs336_alignment import safety_rlhf
 
 
 def run_tokenize_prompt_and_output(
@@ -46,7 +48,7 @@ def run_tokenize_prompt_and_output(
                 with labels, with value 1 where the corresponding label token
                 is part of the response and 0 otherwise.
     """
-    raise NotImplementedError
+    return grpo.tokenize_prompt_and_output(prompt_strs, output_strs, tokenizer)
 
 
 def run_get_response_log_probs(
@@ -82,7 +84,7 @@ def run_get_response_log_probs(
                 entropy for each position (present only if
                 return_token_entropy=True).
     """
-    raise NotImplementedError
+    return grpo.get_response_log_probs(model, input_ids, labels, return_token_entropy)
 
 
 def run_compute_rollout_rewards(
@@ -114,7 +116,7 @@ def run_compute_rollout_rewards(
                 Reward statistics to log. At minimum, include the mean total
                 and format rewards over the rollout batch.
     """
-    raise NotImplementedError
+    return grpo.compute_rollout_rewards(reward_fn, rollout_responses, repeated_ground_truths)
 
 
 def run_compute_group_normalized_rewards(
@@ -153,13 +155,19 @@ def run_compute_group_normalized_rewards(
                 your choice of other statistics to log (e.g. mean, std, max/min
                 of rewards).
     """
-    raise NotImplementedError
+    return grpo.compute_group_normalized_rewards(
+        raw_rewards,
+        group_size,
+        baseline,
+        advantage_eps,
+        advantage_normalizer,
+    )
 
 
 def run_compute_policy_gradient_loss(
     raw_rewards_or_advantages: torch.Tensor,
     policy_log_probs: torch.Tensor,
-    importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo"] = "none",
+    importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo", "cispo"] = "none",
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
     response_mask: torch.Tensor | None = None,
@@ -200,7 +208,14 @@ def run_compute_policy_gradient_loss(
                 Statistics from the underlying loss call, such as
                 clip-fraction components.
     """
-    raise NotImplementedError
+    return grpo.compute_policy_gradient_loss(
+        raw_rewards_or_advantages,
+        policy_log_probs,
+        importance_reweighting_method,
+        old_log_probs,
+        cliprange,
+        response_mask,
+    )
 
 
 def run_aggregate_loss_across_microbatch(
@@ -232,7 +247,12 @@ def run_aggregate_loss_across_microbatch(
             A scalar containing the average loss. Make sure you can later call
             backward on this loss.
     """
-    raise NotImplementedError
+    return grpo.aggregate_loss_across_microbatch(
+        per_token_policy_gradient_loss,
+        mask,
+        loss_normalization,
+        normalization_constant,
+    )
 
 
 def run_grpo_train_step(
@@ -249,7 +269,7 @@ def run_grpo_train_step(
     baseline: Literal["mean", "none"] = "mean",
     advantage_eps: float = 1e-6,
     advantage_normalizer: Literal["std", "none", "mean"] = "std",
-    importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo"] = "none",
+    importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo", "cispo"] = "none",
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
     loss_normalization: Literal["sequence", "constant"] = "sequence",
@@ -321,7 +341,26 @@ def run_grpo_train_step(
                 Dict with metadata from the underlying loss call, gradient norm
                 before clipping, and any other statistics you might want to log.
     """
-    raise NotImplementedError
+    return grpo.grpo_train_step(
+        model=model,
+        tokenizer=tokenizer,
+        optimizer=optimizer,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        max_grad_norm=max_grad_norm,
+        reward_fn=reward_fn,
+        repeated_prompts=repeated_prompts,
+        rollout_responses=rollout_responses,
+        repeated_ground_truths=repeated_ground_truths,
+        group_size=group_size,
+        baseline=baseline,
+        advantage_eps=advantage_eps,
+        advantage_normalizer=advantage_normalizer,
+        importance_reweighting_method=importance_reweighting_method,
+        old_log_probs=old_log_probs,
+        cliprange=cliprange,
+        loss_normalization=loss_normalization,
+        normalization_constant=normalization_constant,
+    )
 
 
 """
@@ -357,7 +396,7 @@ def get_packed_sft_dataset(
         "input_ids" contains the token IDs for the language modeling inputs, and "labels" contains
         the token IDs for the language modeling labels.
     """
-    raise NotImplementedError
+    return safety_rlhf.PackedSFTDataset(tokenizer, dataset_path, seq_length, shuffle)
 
 
 def run_iterate_batches(
@@ -380,7 +419,7 @@ def run_iterate_batches(
     Returns:
         Iterable over batches, where each batch has size `batch_size`.
     """
-    raise NotImplementedError
+    return safety_rlhf.iterate_batches(dataset, batch_size, shuffle)
 
 
 def run_parse_mmlu_response(
@@ -406,7 +445,7 @@ def run_parse_mmlu_response(
         str (one of "A", "B", "C", or "D") if the model output can be parsed into a prediction,
         else None.
     """
-    raise NotImplementedError
+    return safety_rlhf.parse_mmlu_response(mmlu_example, model_output)
 
 
 def run_parse_gsm8k_response(
@@ -423,7 +462,7 @@ def run_parse_gsm8k_response(
         str with the predicted numeric answer if the model output can be parsed into a prediction,
         else None.
     """
-    raise NotImplementedError
+    return safety_rlhf.parse_gsm8k_response(model_output)
 
 
 def run_compute_per_instance_dpo_loss(
@@ -458,4 +497,12 @@ def run_compute_per_instance_dpo_loss(
     Returns:
         torch.Tensor with the DPO loss for this example.
     """
-    raise NotImplementedError
+    return safety_rlhf.compute_per_instance_dpo_loss(
+        lm,
+        lm_ref,
+        tokenizer,
+        beta,
+        prompt,
+        response_chosen,
+        response_rejected,
+    )
