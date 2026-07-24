@@ -127,6 +127,14 @@ def compute_policy_gradient_loss(
     advantages = raw_rewards_or_advantages.reshape(-1, 1)
     metadata: dict[str, Tensor] = {}
 
+    def clip_fraction(clipped_positions: Tensor) -> Tensor:
+        if response_mask is None:
+            return clipped_positions.float().mean()
+        mask = response_mask.to(dtype=clipped_positions.dtype)
+        if mask.sum() == 0:
+            return torch.zeros((), device=clipped_positions.device)
+        return (clipped_positions.to(dtype=mask.dtype) * mask).sum() / mask.sum()
+
     if importance_reweighting_method == "none":
         return -advantages * policy_log_probs, metadata
 
@@ -141,13 +149,13 @@ def compute_policy_gradient_loss(
     if importance_reweighting_method == "grpo":
         clipped_ratios = token_ratios.clamp(1.0 - cliprange, 1.0 + cliprange)
         objective = torch.minimum(advantages * token_ratios, advantages * clipped_ratios)
-        metadata["clip_fraction"] = (torch.abs(token_ratios - 1.0) > cliprange).float().mean()
+        metadata["clip_fraction"] = clip_fraction(torch.abs(token_ratios - 1.0) > cliprange)
         return -objective, metadata
 
     if importance_reweighting_method == "cispo":
         # CISPO 直接裁剪梯度系数；detach 保留该系数，但避免裁剪分支把梯度置零。
         gradient_coefficients = token_ratios.clamp(max=1.0 + cliprange).detach()
-        metadata["clip_fraction"] = (token_ratios > 1.0 + cliprange).float().mean()
+        metadata["clip_fraction"] = clip_fraction(token_ratios > 1.0 + cliprange)
         return -advantages * gradient_coefficients * policy_log_probs, metadata
 
     assert response_mask is not None
@@ -235,6 +243,13 @@ def grpo_train_step(
         advantage_normalizer,
     )
     tokenized = tokenize_prompt_and_output(repeated_prompts, rollout_responses, tokenizer)
+    if old_log_probs is not None:
+        sequence_length = tokenized["input_ids"].shape[1]
+        if old_log_probs.ndim != 2 or old_log_probs.shape[0] != original_batch_size:
+            raise ValueError("old_log_probs must have one row per rollout response.")
+        if old_log_probs.shape[1] < sequence_length:
+            raise ValueError("old_log_probs is shorter than the current tokenization.")
+        old_log_probs = old_log_probs[:, :sequence_length]
     active_indices = torch.nonzero(advantages != 0, as_tuple=False).squeeze(1)
 
     optimizer.zero_grad(set_to_none=True)
@@ -258,6 +273,7 @@ def grpo_train_step(
     total_entropy = torch.zeros((), device=device)
     total_response_tokens = torch.zeros((), device=device)
     weighted_clip_fraction = torch.zeros((), device=device)
+    clip_fraction_weight = torch.zeros((), device=device)
 
     for start in range(0, active_indices.numel(), microbatch_size):
         end = start + microbatch_size
@@ -297,9 +313,14 @@ def grpo_train_step(
         total_entropy = total_entropy + (response_scores["token_entropy"] * micro_mask).sum().detach()
         total_response_tokens = total_response_tokens + micro_response_tokens
         if "clip_fraction" in loss_metadata:
+            if importance_reweighting_method in {"grpo", "cispo"}:
+                micro_clip_weight = micro_response_tokens
+            else:
+                micro_clip_weight = torch.tensor(micro_input_ids.shape[0], device=device)
             weighted_clip_fraction = weighted_clip_fraction + (
-                loss_metadata["clip_fraction"].detach() * micro_input_ids.shape[0]
+                loss_metadata["clip_fraction"].detach() * micro_clip_weight
             )
+            clip_fraction_weight = clip_fraction_weight + micro_clip_weight
 
     grad_norm = torch.sqrt(
         sum(
@@ -311,7 +332,7 @@ def grpo_train_step(
     metadata["grad_norm"] = grad_norm.item()
     metadata["mean_token_entropy"] = (total_entropy / total_response_tokens).item()
     if importance_reweighting_method in {"grpo", "gspo", "cispo"}:
-        metadata["clip_fraction"] = (weighted_clip_fraction / active_indices.numel()).item()
+        metadata["clip_fraction"] = (weighted_clip_fraction / clip_fraction_weight).item()
 
     if max_grad_norm is not None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)

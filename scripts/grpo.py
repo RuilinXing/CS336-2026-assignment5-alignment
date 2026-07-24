@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,7 +21,7 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 
-from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.drgrpo_grader import question_only_reward_fn, r1_zero_reward_fn
 from cs336_alignment.gsm8k import GSM8KExample, load_gsm8k_examples, render_prompt
 from cs336_alignment.grpo import get_response_log_probs, grpo_train_step, tokenize_prompt_and_output
 from cs336_alignment.vllm_utils import VLLMCompletion, VLLMServer
@@ -64,6 +64,12 @@ def parse_args() -> argparse.Namespace:
         "--prompt-path",
         type=Path,
         default=PROJECT_ROOT / "cs336_alignment/prompts/r1_zero.prompt",
+    )
+    parser.add_argument(
+        "--rollout-format",
+        choices=("r1_zero", "question_only"),
+        default=None,
+        help="Required when --prompt-path is a custom template, to select its matching reward and stop rule.",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=0)
@@ -122,17 +128,29 @@ def resolve_training_values(args: argparse.Namespace) -> tuple[AlgorithmSettings
 
 def validate_args(
     args: argparse.Namespace,
+    settings: AlgorithmSettings,
     train_batch_size: int,
     gradient_accumulation_steps: int,
     updates_per_rollout: int,
 ) -> None:
     """在启动昂贵的 GPU 作业前检查 batch 划分是否合理。"""
+    if args.group_size <= 0:
+        raise ValueError("group_size 必须为正数。")
     if args.rollout_batch_size % args.group_size != 0:
         raise ValueError("rollout_batch_size 必须能被 group_size 整除。")
     if train_batch_size % args.group_size != 0:
         raise ValueError("train_batch_size 必须能被 group_size 整除。")
     if train_batch_size > args.rollout_batch_size:
         raise ValueError("train_batch_size 不能大于 rollout_batch_size。")
+    if not settings.uses_small_train_batch and train_batch_size != args.rollout_batch_size:
+        raise ValueError("标准 on-policy GRPO 的 train_batch_size 必须等于 rollout_batch_size。")
+    if settings.uses_small_train_batch:
+        if args.rollout_batch_size % train_batch_size != 0:
+            raise ValueError("off-policy 的 rollout_batch_size 必须能被 train_batch_size 整除。")
+        if updates_per_rollout * train_batch_size != args.rollout_batch_size:
+            raise ValueError("off-policy 的更新必须完整且恰好覆盖一个 rollout batch。")
+    elif updates_per_rollout != 1:
+        raise ValueError("标准 on-policy GRPO 每个 rollout batch 只能更新一次。")
     if train_batch_size % gradient_accumulation_steps != 0:
         raise ValueError("train_batch_size 必须能被 gradient_accumulation_steps 整除。")
     if args.num_rollout_steps <= 0 or args.eval_every <= 0 or updates_per_rollout <= 0:
@@ -181,7 +199,34 @@ class ExperimentLogger:
             self.wandb_run.finish()
 
 
-def build_sampling_params(args: argparse.Namespace, seed_offset: int = 0) -> dict[str, Any]:
+def resolve_rollout_configuration(
+    prompt_path: Path,
+    rollout_format: str | None = None,
+) -> tuple[Callable[[str, str], dict[str, float]], list[str] | None]:
+    """Choose the reward function and stop sequences required by a prompt template."""
+    if rollout_format == "question_only":
+        return question_only_reward_fn, None
+    if rollout_format == "r1_zero":
+        return r1_zero_reward_fn, ["</answer>"]
+
+    prompt_path = prompt_path.resolve()
+    question_only_path = (PROJECT_ROOT / "cs336_alignment/prompts/question_only.prompt").resolve()
+    r1_zero_paths = {
+        (PROJECT_ROOT / "cs336_alignment/prompts/r1_zero.prompt").resolve(),
+        (PROJECT_ROOT / "cs336_alignment/prompts/r1_zero_three_shot_gsm8k.prompt").resolve(),
+    }
+    if prompt_path == question_only_path:
+        return question_only_reward_fn, None
+    if prompt_path in r1_zero_paths:
+        return r1_zero_reward_fn, ["</answer>"]
+    raise ValueError("Custom --prompt-path requires --rollout-format.")
+
+
+def build_sampling_params(
+    args: argparse.Namespace,
+    seed_offset: int = 0,
+    stop_sequences: list[str] | None = None,
+) -> dict[str, Any]:
     """集中保存生成参数，保证训练 rollout 与验证 rollout 使用同一配置。"""
     return {
         "temperature": args.sampling_temperature,
@@ -189,8 +234,8 @@ def build_sampling_params(args: argparse.Namespace, seed_offset: int = 0) -> dic
         "max_tokens": args.sampling_max_tokens,
         "n": 1,
         "seed": args.seed + seed_offset,
-        "stop": ["</answer>"],
-        "include_stop_str_in_output": True,
+        "stop": stop_sequences,
+        "include_stop_str_in_output": stop_sequences is not None,
     }
 
 
@@ -211,9 +256,26 @@ def generate_responses(
 ) -> list[VLLMCompletion]:
     """调用 vLLM，并确认每个输入 prompt 都得到一个 completion。"""
     completions = server.generate_completions(prompts, sampling_params, batch_size=batch_size)
-    if len(completions) != len(prompts):
-        raise RuntimeError(f"vLLM 返回了 {len(completions)} 条结果，但期望 {len(prompts)} 条。")
+    expected_completions = len(prompts) * sampling_params.get("n", 1)
+    if len(completions) != expected_completions:
+        raise RuntimeError(f"vLLM 返回了 {len(completions)} 条结果，但期望 {expected_completions} 条。")
     return completions
+
+
+def generate_grouped_responses(
+    server: VLLMServer,
+    prompts: list[str],
+    group_size: int,
+    sampling_params: dict[str, Any],
+    batch_size: int,
+) -> list[VLLMCompletion]:
+    """Generate independent response groups for each unique prompt."""
+    return generate_responses(
+        server,
+        prompts,
+        {**sampling_params, "n": group_size},
+        batch_size,
+    )
 
 
 @torch.no_grad()
@@ -262,6 +324,7 @@ def evaluate_policy(
     prompt_template: str,
     sampling_params: dict[str, Any],
     batch_size: int,
+    reward_fn: Callable[[str, str], dict[str, float]],
 ) -> tuple[dict[str, float], list[dict[str, Any]]]:
     """在验证集采样一次，并计算总奖励、格式奖励和平均 response 长度。"""
     prompts = [render_prompt(prompt_template, example.question) for example in examples]
@@ -270,7 +333,7 @@ def evaluate_policy(
     format_rewards = []
     records = []
     for example, prompt, completion in zip(examples, prompts, completions, strict=True):
-        reward = r1_zero_reward_fn(completion.text, example.ground_truth)
+        reward = reward_fn(completion.text, example.ground_truth)
         total_rewards.append(reward["reward"])
         format_rewards.append(reward["format_reward"])
         records.append(
@@ -285,7 +348,7 @@ def evaluate_policy(
     metrics = {
         "val_reward": sum(total_rewards) / len(total_rewards),
         "val_format_reward": sum(format_rewards) / len(format_rewards),
-        "val_average_response_length": sum(len(item.text) for item in completions) / len(completions),
+        "val_average_response_length": sum(len(item.token_ids) for item in completions) / len(completions),
     }
     return metrics, records
 
@@ -321,7 +384,7 @@ def main() -> None:
         normalization_constant,
         cliprange,
     ) = resolve_training_values(args)
-    validate_args(args, train_batch_size, gradient_accumulation_steps, updates_per_rollout)
+    validate_args(args, settings, train_batch_size, gradient_accumulation_steps, updates_per_rollout)
     set_seed(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -331,6 +394,7 @@ def main() -> None:
         raise ValueError("训练集和验证集都必须至少包含一个 GSM8K 样本。")
     random.Random(args.seed).shuffle(train_examples)
     prompt_template = args.prompt_path.read_text(encoding="utf-8")
+    reward_fn, stop_sequences = resolve_rollout_configuration(args.prompt_path, args.rollout_format)
     prompts_per_rollout = args.rollout_batch_size // args.group_size
 
     device = torch.device(f"cuda:{args.train_gpu}")
@@ -383,10 +447,11 @@ def main() -> None:
 
             # 每次生成前同步最新训练权重，才能保证这是 on-policy rollout。
             server.sync_policy_weights(model)
-            completions = generate_responses(
+            completions = generate_grouped_responses(
                 server,
-                repeated_prompts,
-                build_sampling_params(args, step),
+                prompts,
+                args.group_size,
+                build_sampling_params(args, step, stop_sequences),
                 args.rollout_batch_size,
             )
             responses = [completion.text for completion in completions]
@@ -414,7 +479,7 @@ def main() -> None:
                     optimizer=optimizer,
                     gradient_accumulation_steps=gradient_accumulation_steps,
                     max_grad_norm=args.max_grad_norm,
-                    reward_fn=r1_zero_reward_fn,
+                    reward_fn=reward_fn,
                     repeated_prompts=train_prompts,
                     rollout_responses=train_responses,
                     repeated_ground_truths=train_ground_truths,
@@ -449,7 +514,7 @@ def main() -> None:
                             "prompt": prompt,
                             "response": completion.text,
                             "finish_reason": completion.finish_reason,
-                            "scores": r1_zero_reward_fn(completion.text, example.ground_truth),
+                            "scores": reward_fn(completion.text, example.ground_truth),
                         }
                         for example, prompt, completion in zip(
                             (example for example in prompt_examples for _ in range(args.group_size)),
@@ -467,8 +532,9 @@ def main() -> None:
                     server,
                     val_examples,
                     prompt_template,
-                    build_sampling_params(args, 10_000 + step),
+                    build_sampling_params(args, 10_000 + step, stop_sequences),
                     args.eval_batch_size,
+                    reward_fn,
                 )
                 logger.log({"step": step, "split": "validation", **val_metrics})
                 write_rollouts(args.output_dir / "validation", step, val_records[:10])

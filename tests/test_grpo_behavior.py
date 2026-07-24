@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from .adapters import (
@@ -138,6 +139,24 @@ def test_cispo_keeps_a_clipped_gradient_for_large_importance_weights():
     torch.testing.assert_close(policy_log_probs.grad, torch.tensor([[-1.1]]))
 
 
+@pytest.mark.parametrize("method", ["grpo", "cispo"])
+def test_clip_fraction_ignores_prompt_and_padding_tokens(method):
+    policy_log_probs = torch.log(torch.tensor([[2.0, 1.0, 4.0]]))
+    old_log_probs = torch.zeros_like(policy_log_probs)
+    response_mask = torch.tensor([[False, True, False]])
+
+    _, metadata = run_compute_policy_gradient_loss(
+        torch.tensor([1.0]),
+        policy_log_probs,
+        method,
+        old_log_probs,
+        cliprange=0.1,
+        response_mask=response_mask,
+    )
+
+    torch.testing.assert_close(metadata["clip_fraction"], torch.tensor(0.0))
+
+
 def test_gspo_uses_only_response_tokens_for_sequence_ratio():
     policy_log_probs = torch.log(torch.tensor([[2.0, 0.5, 4.0]]))
     old_log_probs = torch.zeros_like(policy_log_probs)
@@ -200,3 +219,72 @@ def test_train_step_skips_zero_advantage_rollouts_and_clears_gradients(tokenizer
     assert not torch.equal(model.logits.detach(), initial_logits)
     assert loss.ndim == 0
     assert all(parameter.grad is None for parameter in model.parameters())
+
+
+def test_train_step_clip_fraction_is_weighted_by_response_tokens(tokenizer):
+    model = CountingUniformModel(len(tokenizer))
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    prompts = ["Hello", "Hello"]
+    responses = ["world", "world test"]
+    tokenized = run_tokenize_prompt_and_output(prompts, responses, tokenizer)
+    uniform_log_prob = -torch.log(torch.tensor(float(len(tokenizer))))
+    old_log_probs = torch.full_like(tokenized["input_ids"], uniform_log_prob, dtype=torch.float32)
+    old_log_probs[0, tokenized["response_mask"][0]] -= torch.log(torch.tensor(2.0))
+
+    def reward_fn(response: str, ground_truth: str) -> dict[str, float]:
+        del response, ground_truth
+        return {"reward": 1.0, "format_reward": 1.0, "answer_reward": 1.0}
+
+    _, metadata = run_grpo_train_step(
+        model=model,
+        tokenizer=tokenizer,
+        optimizer=optimizer,
+        gradient_accumulation_steps=2,
+        max_grad_norm=None,
+        reward_fn=reward_fn,
+        repeated_prompts=prompts,
+        rollout_responses=responses,
+        repeated_ground_truths=["42", "42"],
+        group_size=1,
+        baseline="none",
+        advantage_normalizer="none",
+        importance_reweighting_method="grpo",
+        old_log_probs=old_log_probs,
+        cliprange=0.1,
+    )
+
+    assert metadata["clip_fraction"] == pytest.approx(1 / 3)
+
+
+def test_off_policy_train_step_aligns_old_log_probs_to_selected_batch(tokenizer):
+    model = CountingUniformModel(len(tokenizer))
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    full_prompts = ["Hello", "Hello", "Hello"]
+    full_responses = ["world test", "another test", "world test something something"]
+    full_tokenized = run_tokenize_prompt_and_output(full_prompts, full_responses, tokenizer)
+    selected_tokenized = run_tokenize_prompt_and_output(full_prompts[:2], full_responses[:2], tokenizer)
+    assert full_tokenized["input_ids"].shape[1] > selected_tokenized["input_ids"].shape[1]
+    old_log_probs = torch.zeros((2, full_tokenized["input_ids"].shape[1]))
+
+    def reward_fn(response: str, ground_truth: str) -> dict[str, float]:
+        del response, ground_truth
+        return {"reward": 1.0, "format_reward": 1.0, "answer_reward": 1.0}
+
+    loss, _ = run_grpo_train_step(
+        model=model,
+        tokenizer=tokenizer,
+        optimizer=optimizer,
+        gradient_accumulation_steps=1,
+        max_grad_norm=None,
+        reward_fn=reward_fn,
+        repeated_prompts=full_prompts[:2],
+        rollout_responses=full_responses[:2],
+        repeated_ground_truths=["42", "42"],
+        group_size=1,
+        baseline="none",
+        advantage_normalizer="none",
+        importance_reweighting_method="noclip",
+        old_log_probs=old_log_probs,
+    )
+
+    assert torch.isfinite(loss)

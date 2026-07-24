@@ -17,6 +17,11 @@ class GSM8KExample:
 
 def load_gsm8k_examples(dataset_path: Path, max_examples: int | None = None) -> list[GSM8KExample]:
     """读取 JSONL，并将 ``####`` 后的内容作为奖励函数使用的最终答案。"""
+    if max_examples is not None and max_examples < 0:
+        raise ValueError("max_examples must be non-negative.")
+    if max_examples == 0:
+        return []
+
     examples: list[GSM8KExample] = []
     with dataset_path.open(encoding="utf-8") as dataset_file:
         for line in dataset_file:

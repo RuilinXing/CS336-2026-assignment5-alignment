@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -104,6 +105,16 @@ def load_safety_examples(dataset_path: Path) -> list[dict[str, Any]]:
         return list(csv.DictReader(csv_file))
 
 
+def numeric_answers_equal(prediction: str | None, answer: str) -> bool:
+    """Compare parsed numeric answers while accepting equivalent decimal spellings."""
+    if prediction is None:
+        return False
+    try:
+        return Decimal(prediction.replace(",", "")) == Decimal(answer.replace(",", ""))
+    except InvalidOperation:
+        return False
+
+
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as output_file:
@@ -186,7 +197,11 @@ def main() -> None:
                 "generation": completion.text,
                 "finish_reason": completion.finish_reason,
                 "prediction": prediction,
-                "correct": prediction == example["answer"],
+                "correct": (
+                    prediction == example["answer"]
+                    if args.task == "mmlu"
+                    else numeric_answers_equal(prediction, example["answer"])
+                ),
             }
         )
     parsed_records = [record for record in records if record["prediction"] is not None]
