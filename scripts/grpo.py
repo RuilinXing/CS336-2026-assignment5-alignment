@@ -199,6 +199,31 @@ class ExperimentLogger:
             self.wandb_run.finish()
 
 
+def print_training_metrics(record: dict[str, Any]) -> None:
+    """Print the assignment-required training or validation metrics."""
+    if record["split"] == "train":
+        metrics = [
+            f"step={record['step']}",
+            f"update={record['update_index']}",
+            f"loss={record['loss']:.4f}",
+            f"grad_norm={record['grad_norm']:.4f}",
+            f"token_entropy={record['mean_token_entropy']:.4f}",
+            f"train_reward={record['mean_reward']:.4f}",
+            f"train_format_reward={record['mean_format_reward']:.4f}",
+        ]
+        if "clip_fraction" in record:
+            metrics.append(f"clip_fraction={record['clip_fraction']:.4f}")
+        print(" ".join(metrics), flush=True)
+        return
+
+    print(
+        f"step={record['step']} val_reward={record['val_reward']:.4f} "
+        f"val_format_reward={record['val_format_reward']:.4f} "
+        f"val_average_response_length={record['val_average_response_length']:.1f}",
+        flush=True,
+    )
+
+
 def resolve_rollout_configuration(
     prompt_path: Path,
     rollout_format: str | None = None,
@@ -492,16 +517,16 @@ def main() -> None:
                     loss_normalization=settings.loss_normalization,
                     normalization_constant=normalization_constant,
                 )
-                logger.log(
-                    {
-                        "step": step,
-                        "update_index": update_index,
-                        "algorithm": args.algorithm,
-                        "split": "train",
-                        "loss": loss.item(),
-                        **train_metadata,
-                    }
-                )
+                train_record = {
+                    "step": step,
+                    "update_index": update_index,
+                    "algorithm": args.algorithm,
+                    "split": "train",
+                    "loss": loss.item(),
+                    **train_metadata,
+                }
+                logger.log(train_record)
+                print_training_metrics(train_record)
 
             if args.rollout_log_every and step % args.rollout_log_every == 0:
                 write_rollouts(
@@ -536,7 +561,9 @@ def main() -> None:
                     args.eval_batch_size,
                     reward_fn,
                 )
-                logger.log({"step": step, "split": "validation", **val_metrics})
+                validation_record = {"step": step, "split": "validation", **val_metrics}
+                logger.log(validation_record)
+                print_training_metrics(validation_record)
                 write_rollouts(args.output_dir / "validation", step, val_records[:10])
                 model.train()
 
