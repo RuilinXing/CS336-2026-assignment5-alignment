@@ -135,6 +135,7 @@ def start_server(
         host,
         "--port",
         str(port),
+        "--disable-uvicorn-access-log",
         "--dtype",
         "bfloat16",
         "--enable-prefix-caching",
